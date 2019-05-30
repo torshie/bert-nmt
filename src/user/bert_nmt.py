@@ -4,7 +4,7 @@ import os.path
 import torch
 
 import fairseq.tokenizer
-from fairseq import options
+from fairseq import options, utils
 from fairseq.models import (
     transformer, register_model, register_model_architecture,
     FairseqModel, FairseqEncoder
@@ -37,15 +37,31 @@ class BertCompatibleDictionary(Dictionary):
         self.nspecial = len(self.symbols)
 
 
-class WrapBertTokenizer:
-    def __init__(self, tokenizer: BertTokenizer):
-        self.__tokenizer = tokenizer
+class BertBasedDictionary:
+    def __init__(self, name: str):
+        self.__tokenizer = self.__create_tokenizer(name)
         self.__pad, self.__unk, self.__bos, self.__eos = \
-            tokenizer.convert_tokens_to_ids(['[PAD]', '[UNK]', '[CLS]', '[SEP]'])
+            self.__tokenizer.convert_tokens_to_ids(['[PAD]', '[UNK]', '[CLS]', '[SEP]'])
         self.unk_word = '<unk>'
 
     def __len__(self):
         return len(self.__tokenizer.vocab)
+
+    def __create_tokenizer(self, name: str):
+        suffix = (
+            'st', 'nd', 'rd', 'th',
+            'mm', 'm',
+            'ns', 'ms', 's', 'min', 'hr', 'h'
+        )
+        never_split = ['[PAD]', '[UNK]', '[CLS]', '[SEP]']
+        for s in suffix:
+            never_split.append('##' + s)
+        for i in range(10):
+            never_split.append('##' + str(i))
+
+        lower = (name == 'bert-base-chinese' or name.find('uncased') >= 0)
+
+        return BertTokenizer.from_pretrained(name, never_split=never_split, do_lower_case=lower)
 
     def dummy_sentence(self, length):
         t = torch.Tensor(length).uniform_(self.eos() + 2, len(self)).long()
@@ -58,6 +74,17 @@ class WrapBertTokenizer:
             return '<{}>'.format(self.unk_word)
         else:
             return self.unk_word
+
+    def string(self, tensor, bpe_symbol=None, escape_unk=False):
+        """Helper for converting a tensor of token indices to a string.
+
+        Can optionally remove BPE symbols or escape <unk> words.
+        """
+        if torch.is_tensor(tensor) and tensor.dim() == 2:
+            return '\n'.join(self.string(t) for t in tensor)
+
+        tk = self.__tokenizer.convert_ids_to_tokens([x.item() for x in tensor])
+        return ' '.join(tk)
 
     def encode_line(self, line, reverse_order=False, **kwargs):
         words = self.__tokenizer.tokenize(line)
@@ -83,24 +110,26 @@ class WrapBertTokenizer:
         return self.__eos
 
 
-class WrapBertModel(FairseqEncoder):
-    def __init__(self, dictionary: WrapBertTokenizer, bert: BertModel):
+class BertTranslationEncoder(FairseqEncoder):
+    def __init__(self, args: argparse.Namespace, dictionary: BertBasedDictionary=None):
+        if dictionary is None:
+            dictionary = BertBasedDictionary(args.bert_name)
         super().__init__(dictionary)
-
-        self.__bert = bert
+        self.args = args
+        self.bert = BertModel.from_pretrained(args.bert_name)
 
     def forward(self, src_tokens, src_lengths):
-        batch_size, max_length = src_tokens.shape
-        tmp = torch.arange(max_length, dtype=torch.long).repeat([batch_size, 1]).cuda()
-        masks = tmp < src_lengths.view(batch_size, 1)
-        paddings = masks ^ 1
+        paddings = src_tokens.eq(self.dictionary.pad())
+        masks = paddings ^ 1
 
         with torch.no_grad():
-            encoder_out = self.__bert(src_tokens, torch.zeros_like(src_tokens),
-                masks.long(), False)
+            bert_out = self.bert(src_tokens, torch.zeros_like(src_tokens),
+                masks)
+
+        encoder_out = bert_out[0][self.args.bert_layer].transpose(0, 1)
 
         return {
-            'encoder_out': encoder_out[0],
+            'encoder_out': encoder_out,
             'encoder_padding_mask': paddings
         }
 
@@ -113,40 +142,17 @@ class WrapBertModel(FairseqEncoder):
 
 
 @register_model('bert_nmt')
-class BertNMT(FairseqModel):
-    def __init__(self, args: argparse.Namespace, encoder: WrapBertModel,
-            decoder: transformer.TransformerDecoder):
-        super(BertNMT, self).__init__(encoder, decoder)
-
-        self.__args = args
-
+class BertTranslationModel(FairseqModel):
     @staticmethod
     def add_args(parser: argparse.ArgumentParser):
-        parser.add_argument('--bert-name',
-            choices=('bert-base-cased', 'bert-base-uncased',
-                'bert-large-cased', 'bert-large-uncased',
-                'bert-base-multilingual-uncased',
-                'bert-base-multilingual-cased', 'bert-base-chinese'))
+        parser.add_argument('--bert-layer', type=int)
 
     @classmethod
     def build_model(cls, args: argparse.Namespace,
             task: translation.FairseqTask):
-        if args.bert_name.find('large') >= 0:
-            cls.__large_model(args)
-        else:
-            cls.__base_model(args)
-
-        bert_wrapper = cls.__build_bert_wrapper(args)
+        encoder = BertTranslationEncoder(args.bert_name)
         decoder = cls.__build_transformer_decoder(args, task.target_dictionary)
-        return BertNMT(args, bert_wrapper, decoder)
-
-    @staticmethod
-    def __build_bert_wrapper(args: argparse.Namespace):
-        bert_name = args.bert_name
-        tokenizer = BertTokenizer.from_pretrained(bert_name)
-        tokenizer_wrapper = WrapBertTokenizer(tokenizer)
-        bert_model = BertModel.from_pretrained(bert_name)
-        return WrapBertModel(tokenizer_wrapper, bert_model)
+        return BertTranslationModel(encoder, decoder)
 
     @classmethod
     def __build_transformer_decoder(cls, args: argparse.Namespace,
@@ -157,14 +163,6 @@ class BertNMT(FairseqModel):
             decoder_embed_tokens)
         return decoder
 
-    @classmethod
-    def __large_model(cls, args: argparse.Namespace):
-        pass
-
-    @classmethod
-    def __base_model(cls, args: argparse.Namespace):
-        pass
-
     @staticmethod
     def __build_embedding(dictionary, embed_dim):
         num_embeddings = len(dictionary)
@@ -174,7 +172,52 @@ class BertNMT(FairseqModel):
 
 
 @register_task('bert_translation')
-class BertTranslation(translation.TranslationTask):
+class BertTranslationTask(translation.TranslationTask):
+    @staticmethod
+    def add_args(parser):
+        """Add task-specific arguments to the parser."""
+        # fmt: off
+        parser.add_argument('--bert-name',
+                            choices=('bert-base-cased', 'bert-base-uncased',
+                                     'bert-large-cased', 'bert-large-uncased',
+                                     'bert-base-multilingual-uncased',
+                                     'bert-base-multilingual-cased',
+                                     'bert-base-chinese'),
+                            help='pretrained bert model name')
+        parser.add_argument('--lazy-load', action='store_true',
+                            help='load the dataset lazily')
+        parser.add_argument('--raw-text', action='store_true',
+                            help='load raw text dataset')
+        parser.add_argument('--left-pad-source', default='True', type=str, metavar='BOOL',
+                            help='pad the source on the left')
+        parser.add_argument('--left-pad-target', default='False', type=str, metavar='BOOL',
+                            help='pad the target on the left')
+        parser.add_argument('--max-source-positions', default=512, type=int, metavar='N',
+                            help='max number of tokens in the source sequence')
+        parser.add_argument('--max-target-positions', default=1024, type=int, metavar='N',
+                            help='max number of tokens in the target sequence')
+        parser.add_argument('--upsample-primary', default=1, type=int,
+                            help='amount to upsample primary dataset')
+        # fmt: on
+
+    @staticmethod
+    def load_pretrained_model(path, src_dict_path, tgt_dict_path, arg_overrides=None):
+        model = utils.load_checkpoint_to_cpu(path)
+        args = model['args']
+        state_dict = model['model']
+        args = utils.override_model_args(args, arg_overrides)
+        src_dict = BertBasedDictionary(args.bert_name)
+        tgt_dict = Dictionary.load(tgt_dict_path)
+        assert src_dict.pad() == tgt_dict.pad()
+        assert src_dict.eos() == tgt_dict.eos()
+        assert src_dict.unk() == tgt_dict.unk()
+
+        task = BertTranslationTask(args, src_dict, tgt_dict)
+        model = task.build_model(args)
+        model.upgrade_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=True)
+        return model
+
     @classmethod
     def setup_task(cls, args, **kwargs):
         """Setup the task (e.g., load dictionaries).
@@ -191,7 +234,7 @@ class BertTranslation(translation.TranslationTask):
         if args.source_lang is None or args.target_lang is None:
             raise Exception('Could not infer language pair, please provide it explicitly')
 
-        src_dict = WrapBertTokenizer(BertTokenizer.from_pretrained(args.bert_name))
+        src_dict = BertBasedDictionary(args.bert_name)
         tgt_dict = cls.load_dictionary(os.path.join(args.data[0], 'dict.{}.txt'.format(args.target_lang)))
         assert src_dict.pad() == tgt_dict.pad(), "%d != %d" % (src_dict.pad(), tgt_dict.pad())
         assert src_dict.eos() == tgt_dict.eos(), "%d != %d" % (src_dict.eos(), tgt_dict.eos())
@@ -232,17 +275,14 @@ class BertTranslation(translation.TranslationTask):
 
 
 @register_model_architecture('bert_nmt', 'bert_nmt')
-def base_bert_nmt(args: argparse.Namespace):
-    args.encoder_embed_path = getattr(args, 'encoder_embed_path', None)
-    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 512)
-    args.encoder_ffn_embed_dim = getattr(args, 'encoder_ffn_embed_dim', 2048)
-    args.encoder_layers = getattr(args, 'encoder_layers', 6)
-    args.encoder_attention_heads = getattr(args, 'encoder_attention_heads', 8)
-    args.encoder_normalize_before = getattr(args, 'encoder_normalize_before', False)
-    args.encoder_learned_pos = getattr(args, 'encoder_learned_pos', False)
+def bert_nmt_base(args: argparse.Namespace):
+    args.bert_layer = getattr(args, 'bert_layer', -2)
     args.decoder_embed_path = getattr(args, 'decoder_embed_path', None)
-    args.decoder_embed_dim = 768  #getattr(args, 'decoder_embed_dim', args.encoder_embed_dim)
-    args.decoder_ffn_embed_dim = getattr(args, 'decoder_ffn_embed_dim', args.encoder_ffn_embed_dim)
+    if args.bert_name.find('base') >= 0:
+        args.decoder_embed_dim = 768
+    else:
+        args.decoder_embed_dim = 1024
+    args.decoder_ffn_embed_dim = getattr(args, 'decoder_ffn_embed_dim', 2048)
     args.decoder_layers = getattr(args, 'decoder_layers', 6)
     args.decoder_attention_heads = getattr(args, 'decoder_attention_heads', 8)
     args.decoder_normalize_before = getattr(args, 'decoder_normalize_before', False)
@@ -259,3 +299,19 @@ def base_bert_nmt(args: argparse.Namespace):
 
     args.decoder_output_dim = getattr(args, 'decoder_output_dim', args.decoder_embed_dim)
     args.decoder_input_dim = getattr(args, 'decoder_input_dim', args.decoder_embed_dim)
+
+
+@register_model_architecture('bert_nmt', 'bert_nmt_big')
+def bert_nmt_big(args):
+    args.decoder_ffn_embed_dim = getattr(args, 'decoder_ffn_embed_dim', 4096)
+    args.decoder_attention_heads = getattr(args, 'decoder_attention_heads', 16)
+    args.dropout = getattr(args, 'dropout', 0.3)
+    bert_nmt_base(args)
+
+
+@register_model_architecture('bert_nmt', 'bert_nmt_big_t2t')
+def bert_nmt_big_t2t(args: argparse.Namespace):
+    args.decoder_normalize_before = getattr(args, 'decoder_normalize_before', True)
+    args.attention_dropout = getattr(args, 'attention_dropout', 0.1)
+    args.relu_dropout = getattr(args, 'relu_dropout', 0.1)
+    bert_nmt_big(args)

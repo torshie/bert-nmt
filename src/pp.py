@@ -18,8 +18,6 @@ from fairseq.binarizer import Binarizer
 from fairseq.utils import import_user_module
 from multiprocessing import Pool
 
-from pytorch_pretrained_bert import BertTokenizer
-
 import os
 import shutil
 
@@ -27,7 +25,7 @@ import shutil
 def main(args):
     import_user_module(args)
 
-    from user.bert_nmt import WrapBertTokenizer
+    from user.bert_nmt import BertBasedDictionary
 
     print(args)
 
@@ -78,7 +76,7 @@ def main(args):
         else:
             tgt_dict = None
 
-    src_dict = WrapBertTokenizer(BertTokenizer.from_pretrained(args.bert_name))
+    src_dict = BertBasedDictionary(args.bert_name)
     if target and tgt_dict is not None:
         tgt_dict.save(dict_path(args.target_lang))
 
@@ -260,13 +258,13 @@ def merge_files(files, outpath):
 
 
 def cli_main():
-    parser = options.get_preprocessing_parser()
-    parser.add_argument('--bert-name', required=True,
-                        choices=('bert-base-cased', 'bert-base-uncased',
-                                 'bert-large-cased', 'bert-large-uncased',
-                                 'bert-base-multilingual-uncased',
-                                 'bert-base-multilingual-cased',
-                                 'bert-base-chinese'))
+    tmp_parser = options.get_parser('Preprocessing', 'translation')
+    tmp_args, _ = tmp_parser.parse_known_args()
+
+    parser = options.get_parser('Preprocessing', 'translation')
+    tasks.get_task(tmp_args.task).add_args(parser)
+    options.add_preprocess_args(parser)
+
     args = parser.parse_args()
     main(args)
 
