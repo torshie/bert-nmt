@@ -25,7 +25,7 @@ import shutil
 def main(args):
     import_user_module(args)
 
-    from user.bert_nmt import BertBasedDictionary
+    from bert_nmt import BertBasedDictionary
 
     print(args)
 
@@ -258,11 +258,14 @@ def merge_files(files, outpath):
 
 
 def cli_main():
-    tmp_parser = options.get_parser('Preprocessing', 'translation')
-    tmp_args, _ = tmp_parser.parse_known_args()
-
     parser = options.get_parser('Preprocessing', 'translation')
-    tasks.get_task(tmp_args.task).add_args(parser)
+    parser.add_argument('--bert-name',
+                        choices=('bert-base-cased', 'bert-base-uncased',
+                                 'bert-large-cased', 'bert-large-uncased',
+                                 'bert-base-multilingual-uncased',
+                                 'bert-base-multilingual-cased',
+                                 'bert-base-chinese'),
+                        help='pretrained bert model name')
     options.add_preprocess_args(parser)
 
     args = parser.parse_args()

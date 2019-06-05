@@ -14,14 +14,86 @@ import itertools
 import os
 import math
 import random
+import inspect
 
 import torch
 
 from fairseq import distributed_utils, options, progress_bar, tasks, utils
+from fairseq.models import BaseFairseqModel
 from fairseq.data import iterators
 from fairseq.trainer import Trainer
 from fairseq.meters import AverageMeter, StopwatchMeter
 from fairseq.utils import import_user_module
+from fairseq.legacy_distributed_data_parallel import LegacyDistributedDataParallel
+
+
+def DistributedFairseqModel(args, model):
+    """
+    Wrap a *model* to support distributed data parallel training.
+
+    This is similar to the built-in DistributedDataParallel, but allows
+    additional configuration of the DistributedDataParallel class to
+    use, and also provides easier access to the wrapped model by
+    forwarding requests for missing attributes to the wrapped model.
+
+    Args:
+        args (argparse.Namespace): fairseq args
+        model (BaseFairseqModel): model to wrap
+    """
+
+    # determine which DDP class to extend
+    assert isinstance(model, BaseFairseqModel)
+    if args.ddp_backend == 'c10d':
+        ddp_class = torch.nn.parallel.DistributedDataParallel
+        init_kwargs = dict(
+            module=model,
+            device_ids=[args.device_id],
+            output_device=args.device_id,
+            broadcast_buffers=False,
+            bucket_cap_mb=args.bucket_cap_mb,
+            find_unused_parameters=True,
+        )
+        # Maintain backward compatibility for 0.4 or earlier
+        if 'check_reduction' in inspect.getargspec(ddp_class)[0]:
+            init_kwargs['check_reduction'] = True
+    elif args.ddp_backend == 'no_c10d':
+        ddp_class = LegacyDistributedDataParallel
+        init_kwargs = dict(
+            module=model,
+            world_size=args.distributed_world_size,
+            buffer_size=2**28,
+            find_unused_parameters=True,
+        )
+    else:
+        raise ValueError('Unknown --ddp-backend: ' + args.ddp_backend)
+
+    class _DistributedFairseqModel(ddp_class):
+        """Extend DistributedDataParallel to check for missing
+        attributes in the wrapped module."""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+        def __getattr__(self, name):
+            wrapped_module = super().__getattr__('module')
+            if hasattr(wrapped_module, name):
+                return getattr(wrapped_module, name)
+            return super().__getattr__(name)
+
+    return _DistributedFairseqModel(**init_kwargs)
+
+
+class MyTrainer(Trainer):
+    @property
+    def model(self):
+        if self._wrapped_model is None:
+            if self.args.distributed_world_size > 1:
+                self._wrapped_model = DistributedFairseqModel(
+                    self.args, self._model,
+                )
+            else:
+                self._wrapped_model = self._model
+        return self._wrapped_model
 
 
 def main(args, init_distributed=False):
@@ -68,7 +140,7 @@ def main(args, init_distributed=False):
     oom_batch = task.dataset('train').get_dummy_batch(1, max_positions)
 
     # Build trainer
-    trainer = Trainer(args, task, model, criterion, dummy_batch, oom_batch)
+    trainer = MyTrainer(args, task, model, criterion, dummy_batch, oom_batch)
     print('| training on {} GPUs'.format(args.distributed_world_size))
     print('| max tokens per GPU = {} and max sentences per GPU = {}'.format(
         args.max_tokens,

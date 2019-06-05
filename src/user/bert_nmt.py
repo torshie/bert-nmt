@@ -117,25 +117,30 @@ class BertTranslationEncoder(FairseqEncoder):
         super().__init__(dictionary)
         self.args = args
         self.bert = BertModel.from_pretrained(args.bert_name)
+        if not args.no_freeze_bert:
+            for p in self.bert.parameters():
+                p.requires_grad = False
 
     def forward(self, src_tokens, src_lengths):
         paddings = src_tokens.eq(self.dictionary.pad())
         masks = paddings ^ 1
+        if not paddings.any():
+            paddings = None
 
-        with torch.no_grad():
-            bert_out = self.bert(src_tokens, torch.zeros_like(src_tokens),
-                masks)
-
+        bert_out = self.bert(src_tokens, torch.zeros_like(src_tokens),
+            masks)
         encoder_out = bert_out[0][self.args.bert_layer].transpose(0, 1)
 
-        return {
-            'encoder_out': encoder_out,
-            'encoder_padding_mask': paddings
-        }
+        return encoder_out, paddings
 
     def reorder_encoder_out(self, encoder_out, new_order):
-        return transformer.TransformerEncoder.reorder_encoder_out(self,
-            encoder_out, new_order)
+        tmp = {
+            'encoder_out': encoder_out[0],
+            'encoder_padding_mask': encoder_out[1]
+        }
+        transformer.TransformerEncoder.reorder_encoder_out(self,
+            tmp, new_order)
+        return tmp['encoder_out'], tmp['encoder_padding_mask']
 
     def max_positions(self) -> int:
         return 512
@@ -146,13 +151,23 @@ class BertTranslationModel(FairseqModel):
     @staticmethod
     def add_args(parser: argparse.ArgumentParser):
         parser.add_argument('--bert-layer', type=int)
+        parser.add_argument('--no-freeze-bert', default=False, action='store_true')
 
     @classmethod
     def build_model(cls, args: argparse.Namespace,
             task: translation.FairseqTask):
-        encoder = BertTranslationEncoder(args.bert_name)
+        encoder = BertTranslationEncoder(args, task.source_dictionary)
         decoder = cls.__build_transformer_decoder(args, task.target_dictionary)
         return BertTranslationModel(encoder, decoder)
+
+    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+        encoder_out = self.encoder(src_tokens, src_lengths)
+        dict_out = {
+            'encoder_out': encoder_out[0],
+            'encoder_padding_mask': encoder_out[1]
+        }
+        decoder_out = self.decoder(prev_output_tokens, dict_out)
+        return decoder_out
 
     @classmethod
     def __build_transformer_decoder(cls, args: argparse.Namespace,
@@ -174,7 +189,7 @@ class BertTranslationModel(FairseqModel):
 @register_task('bert_translation')
 class BertTranslationTask(translation.TranslationTask):
     @staticmethod
-    def add_args(parser):
+    def add_args(parser: argparse.ArgumentParser):
         """Add task-specific arguments to the parser."""
         # fmt: off
         parser.add_argument('--bert-name',
@@ -184,20 +199,7 @@ class BertTranslationTask(translation.TranslationTask):
                                      'bert-base-multilingual-cased',
                                      'bert-base-chinese'),
                             help='pretrained bert model name')
-        parser.add_argument('--lazy-load', action='store_true',
-                            help='load the dataset lazily')
-        parser.add_argument('--raw-text', action='store_true',
-                            help='load raw text dataset')
-        parser.add_argument('--left-pad-source', default='True', type=str, metavar='BOOL',
-                            help='pad the source on the left')
-        parser.add_argument('--left-pad-target', default='False', type=str, metavar='BOOL',
-                            help='pad the target on the left')
-        parser.add_argument('--max-source-positions', default=512, type=int, metavar='N',
-                            help='max number of tokens in the source sequence')
-        parser.add_argument('--max-target-positions', default=1024, type=int, metavar='N',
-                            help='max number of tokens in the target sequence')
-        parser.add_argument('--upsample-primary', default=1, type=int,
-                            help='amount to upsample primary dataset')
+        translation.TranslationTask.add_args(parser)
         # fmt: on
 
     @staticmethod
