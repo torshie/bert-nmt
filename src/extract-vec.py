@@ -13,6 +13,16 @@ def parse_cmdline():
     return p.parse_args()
 
 
+def convert_word(word):
+    if word == '[PAD]':
+        return '<pad>'
+    if word == '[SEP]':
+        return '</s>'
+    if word == '[UNK]':
+        return '<unk>'
+    return word
+
+
 def main():
     cmdline = parse_cmdline()
     print('Loading pretrained bert model ...')
@@ -36,7 +46,7 @@ def main():
         for i, (offset, word) in enumerate(vocab):
             assert i == offset
             vec = [str(x.item()) for x in final_weights[i]]
-            f.write(word + ' ')
+            f.write(convert_word(word) + ' ')
             f.write(' '.join(vec))
             f.write('\n')
 
